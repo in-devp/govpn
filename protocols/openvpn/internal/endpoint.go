@@ -57,7 +57,7 @@ func (e *endpoint) readLoop() {
 			continue
 		}
 		switch opcode {
-		case Control, ControlHardResetClientV2, ControlHardResetServerV2, Ack:
+		case Control, ControlSoftResetV1, ControlHardResetClientV2, ControlHardResetServerV2, Ack:
 			packet, err := DecodeControl(datagram)
 			if err != nil || packet.LocalSessionID != e.remote {
 				continue
@@ -65,7 +65,7 @@ func (e *endpoint) readLoop() {
 			if opcode != Ack {
 				_ = e.sendAck(packet.PacketID)
 			}
-			if opcode == ControlHardResetClientV2 || opcode == ControlHardResetServerV2 {
+			if opcode == ControlSoftResetV1 || opcode == ControlHardResetClientV2 || opcode == ControlHardResetServerV2 {
 				e.fail(errors.New("openvpn: data channel rekey requested; reconnect required"))
 				return
 			}
@@ -74,7 +74,7 @@ func (e *endpoint) readLoop() {
 				delete(e.pending, acknowledgment)
 				e.pendingMu.Unlock()
 			}
-			if opcode == Control && len(packet.Payload) != 0 {
+			if opcode == Control {
 				e.queueOrdered(packet.PacketID, packet.Payload)
 			}
 		case DataV1, DataV2:
@@ -82,6 +82,9 @@ func (e *endpoint) readLoop() {
 			case e.dataCh <- datagram:
 			case <-e.closed:
 				return
+			default:
+				// IP data is lossy. Keep reading control packets and ACKs
+				// even when the data consumer cannot keep up.
 			}
 		}
 	}
@@ -93,15 +96,21 @@ func (e *endpoint) queueOrdered(packetID uint32, payload []byte) {
 	}
 	if packetID > e.expectedID {
 		if _, exists := e.reordered[packetID]; !exists {
+			if len(e.reordered) >= cap(e.controlCh) {
+				e.fail(errors.New("openvpn: control reorder buffer exhausted; reconnect required"))
+				return
+			}
 			e.reordered[packetID] = append([]byte(nil), payload...)
 		}
 		return
 	}
 	for {
-		select {
-		case e.controlCh <- payload:
-		case <-e.closed:
-			return
+		if len(payload) != 0 {
+			select {
+			case e.controlCh <- payload:
+			case <-e.closed:
+				return
+			}
 		}
 		e.expectedID++
 		var exists bool

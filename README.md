@@ -2,7 +2,7 @@
 
 Pure-Go VPN clients and servers backed by a private gVisor network stack.
 
-- WireGuard, SSTP, OpenVPN, native SoftEther, OpenSSH TUN, and L2TP/IPsec
+- WireGuard, SSTP, OpenVPN, native SoftEther, OpenSSH TUN, L2TP/IPsec, IKEv2/IPsec, and MASQUE CONNECT-IP (HTTP/1.1, HTTP/2, HTTP/3)
 - no CGO
 - no `/dev/tun` or TUN/TAP interface
 - no root privileges or host route changes
@@ -40,6 +40,64 @@ packetConn, err := session.ListenPacket("udp", "10.0.0.2:5353")
 
 These sockets are not visible on the host. Use an explicit proxy when a host
 application needs access to a session socket.
+
+## Server traffic policy
+
+Every protocol server accepts the same `TrafficPolicy` and
+`OnTrafficDecision` fields. An ordered rule policy with a default allow action
+is a blacklist; default deny produces a whitelist. Rules can match traffic
+direction, source and destination CIDRs, destination hostnames, IP protocols,
+and source or destination port ranges:
+
+```go
+policy, err := govpn.NewRuleTrafficPolicy(govpn.TrafficActionAllow, []govpn.TrafficRule{{
+	Name:             "block-example.com",
+	Action:           govpn.TrafficActionDeny,
+	Directions:       []govpn.TrafficDirection{govpn.TrafficDirectionServerEgress},
+	DestinationHosts: []string{"example.com", "*.example.com"},
+}})
+if err != nil {
+	return err
+}
+
+server := wireguard.NewServer(wireguard.ServerConfig{
+	// WireGuard keys, addresses, and peers omitted.
+	TrafficPolicy: policy,
+	OnTrafficDecision: func(event govpn.TrafficPolicyEvent) {
+		if !event.Decision.Allowed() {
+			log.Printf("VPN traffic denied: protocol=%s direction=%s source=%s destination=%s host=%q rule=%q",
+				event.Flow.VPNProtocol, event.Flow.Direction, event.Flow.SourceIP,
+				event.Flow.DestinationIP, event.Flow.DestinationHost, event.Decision.Rule)
+		}
+	},
+})
+```
+
+Client IP packets are checked after protocol authentication/decryption and
+before entering the server's userspace network stack. MASQUE also checks its
+direct peer and forwarding paths. `Session.DialEgressContext` evaluates the
+resolved target before making a host-network connection; the built-in port
+forwarder and example SOCKS5 server use this method, so proxy traffic cannot
+bypass the policy.
+
+Hostname selectors apply only to application egress that supplies the original
+hostname. A client can instead request an IP literal, so security boundaries
+should use destination CIDR rules or a default-deny CIDR allowlist. The callback
+runs synchronously and may be concurrent; it should return promptly.
+
+### IP address matching
+
+`SourcePrefixes` and `DestinationPrefixes` accept CIDR notation for both IPv4
+and IPv6 (e.g., `10.0.0.0/8`, `192.168.1.1/32`, `2001:db8::/32` or
+`2001:db8::1/128`) because `netip.Prefix` supports both address families
+transparently.
+
+To block a host by IP address — regardless of whether it is IPv4 or IPv6 —
+always use `DestinationPrefixes` with its CIDR notation. Do **not** put IP
+address literals in `DestinationHosts`: the host matching is string-based and
+canonical representations vary (e.g., `::1` vs `0:0:0:0:0:0:0:1` for IPv6, or
+trailing dot differences for IPv4), making matches unreliable.
+`DestinationHosts` is for hostname matching only.
 
 ICMP is available through the same userspace stack. The connection carries
 ICMP messages, not host raw sockets:
@@ -208,6 +266,96 @@ or multi-client SSH servers can accept connections themselves and call
 without a TUN channel. The complete server example includes PTY, resize,
 signal forwarding, SFTP, concurrent connections, and userspace tunnels.
 
+## IKEv2/IPsec client and server
+
+IKEv2 uses PSK or EAP-MSCHAPv2 password authentication, assigns an IPv4 virtual
+address with a Configuration Payload, and carries IPv4 packets in an ESP tunnel
+over NAT-T. EAP mode authenticates the responder with an RSA certificate. Both
+roles keep all IPsec state in the process:
+
+```go
+server, err := ikev2.NewServer(ikev2.ServerConfig{
+	ListenIP: "0.0.0.0",
+	PublicIP: "203.0.113.10",
+	Identity: "vpn.example",
+	Users:    map[string]string{"alice": "a-long-random-secret"},
+	Pool:     "192.168.168.0/24",
+})
+
+client := ikev2.NewClient(ikev2.Config{
+	Server:   "vpn.example",
+	LocalID:  "alice",
+	RemoteID: "vpn.example",
+	PSK:      "a-long-random-secret",
+})
+session, err := client.Start(ctx)
+```
+
+The default interoperable proposal is AES-256-CBC, PRF-HMAC-SHA2-256,
+HMAC-SHA2-256-128, and MODP-2048 for IKE; an explicit compatibility option
+enables legacy MODP-1024. ESP uses AES-256-CBC and HMAC-SHA2-256-128. UDP
+encapsulation is forced unless explicitly disabled so
+the implementation does not require a raw ESP socket. The wire behavior follows
+RFC 7296, RFC 3948, and RFC 4303; the suite follows the mandatory-to-implement
+guidance in RFC 8247 and RFC 8221. See the
+[IKEv2 example](examples/ikev2/README.md).
+
+## MASQUE client and server
+
+MASQUE carries IP packets over TLS HTTP/1.1 Upgrade, HTTP/2 Extended CONNECT,
+or HTTP/3 CONNECT-IP. HTTP/3 uses QUIC datagrams with capsule fallback;
+HTTP/1.1 and HTTP/2 carry packets in capsules. Both sides use the same private
+gVisor stack and Session API as the other protocols.
+
+```go
+client := masque.NewClient(masque.Config{
+	Server:   "vpn.example.com",
+	Port:     443,
+	Version:  3,
+	Username: "alice",
+	Password: "secret",
+	CA:       caPEM,
+})
+session, err := client.Start(ctx)
+```
+
+The server assigns IPv4 and/or IPv6 addresses from its configured pools:
+
+```go
+server := masque.NewServer(masque.ServerConfig{
+	ListenIP:   "0.0.0.0",
+	ListenPort: 443,
+	Versions:   []int{1, 2, 3},
+	Cert:       certPEM,
+	Key:        keyPEM,
+	Users:      map[string]string{"alice": "secret"},
+	Pool:       "192.168.168.0/24",
+	IPv6Pool:   "fd00:168::/64",
+})
+session, err := server.Start(ctx)
+```
+
+`Config.Version` selects 1, 2, or 3; zero defaults to HTTP/3. Transport
+unavailability permits fallback to lower versions unless `DisableVersionFallback`
+is set; authentication and certificate failures do not. `ServerConfig.Versions`
+defaults to all three, sharing a port number across TCP and UDP. `Path` accepts
+URI templates and defaults to `/.well-known/masque/ip/{target}/{ipproto}/`.
+Certificates and CA are PEM bytes; `MTU` defaults to 1280.
+
+The server allocates distinct addresses to concurrent clients and releases them
+on disconnect. Both sides support route advertisements, destination/protocol
+scope, ICMP errors and client-subnet forwarding. Established clients reconnect
+with exponential backoff and apply new addresses to the existing Session.
+`Suspend`, `Resume`, `RestartSession`, `Ready` and `WaitReady` control lifecycle;
+use the Client socket methods for readiness-aware dialing. `ForwardPacket` and
+`WritePacket` integrate external userspace routers without installing host routes.
+
+Client extensions include custom TLS configuration, CONNECT URLs, headers,
+protocol identifiers, static addresses, and explicit HTTP/3 compatibility
+options. `TunnelDialer` can replace connection establishment while retaining
+the capsule processing and userspace stack. See the
+[MASQUE examples and configuration](examples/masque/README.md).
+
 ## Protocols
 
 | Package               | Implementation                                                                        |
@@ -218,6 +366,8 @@ signal forwarding, SFTP, concurrent connections, and userspace tunnels.
 | `protocols/softether` | Native SoftEther HTTPS/PACK login and Ethernet data channel                           |
 | `protocols/ssh`       | Pure-Go SSH TUN client/server, IPv4/IPv6, extensible channel/request dispatch         |
 | `protocols/l2tp`      | IKEv1 PSK, NAT-T, ESP transport mode, L2TPv2, PPP, MS-CHAPv2, IPCP/IPv4 client/server |
+| `protocols/ikev2`     | IKEv2 PSK/EAP-MSCHAPv2, responder certificates, NAT-T, IPv4, ESP tunnel, client/server |
+| `protocols/masque`    | TLS HTTP/1.1 Upgrade, HTTP/2 and HTTP/3 CONNECT-IP, Basic auth, IPv4/IPv6, client extensions |
 
 The VPN protocol packages provide `NewClient` and `NewServer`. Complete
 programs are under `examples/`:
@@ -232,6 +382,10 @@ go run ./examples/ssh/client -h
 go run ./examples/ssh/server -h
 go run ./examples/l2tp/client -h
 go run ./examples/l2tp/server -h
+go run ./examples/ikev2/client -h
+go run ./examples/ikev2/server -h
+go run ./examples/masque/client -h
+go run ./examples/masque/server -h
 ```
 
 All client/server examples use `192.168.168.0/24`. Servers expose
@@ -252,7 +406,15 @@ VPN server. See [`examples/README.md`](examples/README.md).
   currently targets Linux `IFF_TUN | IFF_NO_PI` framing. The pure-Go govpn
   client/server path has no OS TUN dependency.
 - L2TP/IPsec supports IKEv1 Main Mode with PSK, NAT-T, AES-CBC, L2TPv2,
-  MS-CHAPv2, and IPCP/IPv4. IPv6 and IKEv2 are not implemented.
+  MS-CHAPv2, and IPCP/IPv4. IPv6 is not implemented.
+- IKEv2/IPsec supports IPv4 tunnel mode, PSK, and EAP-MSCHAPv2 with RSA
+  responder certificates. Generic client certificate authentication, other EAP
+  methods, IPv6, IKE fragmentation, MOBIKE, and Child SA rekeying are not
+  implemented; peers can replace an expired SA with a new connection.
+- MASQUE implements CONNECT-IP; CONNECT-UDP is a separate protocol and is not
+  implemented. Servers expose userspace sockets and explicit packet-forwarding
+  hooks without configuring host routing or NAT. Reconnection preserves the
+  Session, but does not guarantee survival of sockets bound to revoked addresses.
 
 Unsupported settings return an error instead of being ignored.
 

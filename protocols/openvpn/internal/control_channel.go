@@ -39,6 +39,7 @@ type ControlChannel struct {
 	replay     replayWindow
 	readMu     sync.Mutex
 	writeMu    sync.Mutex
+	readBuffer []byte
 }
 
 func NewControlChannel(conn net.Conn, mode ControlProtection, keyValue []byte, auth string, direction int, directionSet, server bool) (*ControlChannel, error) {
@@ -84,6 +85,11 @@ func controlDigest(name string) (func() hash.Hash, int, error) {
 func (c *ControlChannel) Write(plain []byte) (int, error) {
 	c.writeMu.Lock()
 	defer c.writeMu.Unlock()
+	// Data is already protected by the data-channel cipher. Avoid Wrap's
+	// owned copy when this synchronous write can use the caller's buffer.
+	if c.mode == ControlProtectionNone || isDataPacket(plain) {
+		return c.Conn.Write(plain)
+	}
 	wrapped, err := c.Wrap(plain)
 	if err != nil {
 		return 0, err
@@ -97,19 +103,30 @@ func (c *ControlChannel) Write(plain []byte) (int, error) {
 func (c *ControlChannel) Read(buffer []byte) (int, error) {
 	c.readMu.Lock()
 	defer c.readMu.Unlock()
-	wire := make([]byte, 65535)
-	n, err := c.Conn.Read(wire)
-	if err != nil {
-		return 0, err
+	if c.readBuffer == nil {
+		c.readBuffer = make([]byte, 65535)
 	}
-	plain, err := c.Unwrap(wire[:n])
-	if err != nil {
-		return 0, err
+	for {
+		n, err := c.Conn.Read(c.readBuffer)
+		if err != nil {
+			return 0, err
+		}
+		plain := c.readBuffer[:n]
+		// The reusable read buffer stays private until copied below; data
+		// packets do not need Unwrap's additional allocation and copy.
+		if c.mode != ControlProtectionNone && !isDataPacket(plain) {
+			plain, err = c.Unwrap(plain)
+			if err != nil {
+				// Authentication failures and replayed datagrams discard one
+				// packet; they must not tear down an otherwise healthy tunnel.
+				continue
+			}
+		}
+		if len(plain) > len(buffer) {
+			return 0, io.ErrShortBuffer
+		}
+		return copy(buffer, plain), nil
 	}
-	if len(plain) > len(buffer) {
-		return 0, io.ErrShortBuffer
-	}
-	return copy(buffer, plain), nil
 }
 
 func (c *ControlChannel) Wrap(plain []byte) ([]byte, error) {

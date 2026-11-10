@@ -176,7 +176,8 @@ func (s *Session) acquireForwardAlias(address netip.Addr) (bool, error) {
 	}
 	for _, prefix := range s.stack.Addresses() {
 		if prefix.Addr() == address {
-			return false, nil
+			s.forwardAliases[address] = 1
+			return true, nil
 		}
 	}
 	if err := s.stack.AddAddress(netip.PrefixFrom(address, address.BitLen())); err != nil {
@@ -195,6 +196,11 @@ func (s *Session) releaseForwardAlias(address netip.Addr) {
 	refs := s.forwardAliases[address]
 	if refs <= 1 {
 		delete(s.forwardAliases, address)
+		for _, prefix := range s.assignedAddresses {
+			if prefix.Addr() == address {
+				return
+			}
+		}
 		_ = s.stack.RemoveAddress(netip.PrefixFrom(address, address.BitLen()))
 		return
 	}
@@ -233,7 +239,7 @@ func (f *PortForward) acceptLoop() {
 func (f *PortForward) proxy(client net.Conn) {
 	defer f.untrack(client)
 	defer client.Close()
-	target, err := (&net.Dialer{}).DialContext(f.ctx, f.network, f.target)
+	target, err := f.session.DialEgressContext(f.ctx, f.network, f.target, client.RemoteAddr())
 	if err != nil {
 		return
 	}
